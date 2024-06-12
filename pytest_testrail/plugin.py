@@ -51,6 +51,238 @@ class DeprecatedTestDecorator(DeprecationWarning):
 
 warnings.simplefilter(action='once', category=DeprecatedTestDecorator, lineno=0)
 
+import re
+import os
+import sys
+import logging
+from datetime import datetime
+from typing import Union, Tuple
+import jira  # pylint: disable=import-error
+
+JIRA_SERVER = "https://aviatrix.atlassian.net"
+JIRA_USERNAME = "devtools@aviatrix.com"
+JIRA_PARENT_TASK_ID = "AVX-47708"
+pr_title = os.environ.get("PR_TITLE")
+pr_number = os.environ.get("PR_NUMBER")
+commit_sha = os.environ.get("COMMIT_SHA")
+run_id = os.environ.get("RUN_ID")
+build = os.environ.get("build")
+ami_id = os.environ.get("ami_id")
+git_commit_hash = os.environ.get("git_commit_hash")
+
+logging.basicConfig(level=logging.INFO)
+
+
+def get_client() -> jira.JIRA:
+    user = JIRA_USERNAME
+    if os.environ.get("JIRA_TOKEN"):
+        token = os.environ.get("JIRA_TOKEN")
+    if token:
+        jira_client = jira.JIRA(JIRA_SERVER, basic_auth=(user, token))
+    return jira_client
+
+
+def add_comment(client: jira.JIRA, issueid: str, comment: str) -> bool:
+    """Add comment to an issue"""
+    try:
+        issue = client.issue(issueid)
+        client.add_comment(issue, comment)
+    except jira.JIRAError as e:
+        logging.exception(f"Unable to post comment to {issueid} {e}")
+        return False
+    return True
+
+
+def check_repeat_comment(client: jira.JIRA, issueid: str, msg: str) -> Union[str, None]:
+    list_of_comments = client.comments(issueid)
+    for comment in reversed(list_of_comments):
+        # reversed ^^ so that we find the last comment made first.
+        comment_id: str = comment.id
+        assert type(comment_id) == str
+        if (
+            msg in client.comment(issueid, comment_id).body
+            and client.comment(issueid, comment_id).author.emailAddress == JIRA_USERNAME
+        ):
+            return comment_id
+    return None
+
+
+def append_repeat_failure(
+    client: jira.JIRA, issueid: str, commit_sha: str, comment_id: str, run_id: str
+) -> bool:
+    comment_to_update = client.comment(issueid, comment_id)
+    time = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+    new_body = f"""
+    * Test failure repeated @ {time} on commit {commit_sha[0:7]}
+      WORKFLOW_URL: https://github.com/AviatrixDev/cloudn/actions/runs/{run_id}
+    {comment_to_update.body}
+    """
+    try:
+        comment_to_update.update(body=new_body)
+    except jira.JIRAError as e:
+        logging.exception(f"Unable to update comment {comment_id} in issue {issueid}")
+        return False
+    return True
+
+
+def enrich_msg(msg, pr_number: str, pr_title: str, run_id: str, commit_sha: str) -> str:
+    regex = re.compile(r"^AVX-\d\d\d\d+:? (.*)")
+    title = re.search(regex, pr_title).groups()[0]
+    new_msg = f"""
+    {msg}
+    
+    PR-{pr_number}
+    COMMIT-SHA - {commit_sha[0:7]}
+    PR Title - {title}
+    WORKFLOW_URL - https://github.com/AviatrixDev/cloudn/actions/runs/{run_id}
+    """
+    return new_msg
+
+
+def check_if_existing_task_open(
+    client: jira.JIRA, task_name, username: str
+) -> Tuple[bool, str]:
+    """
+    This function will check if a jira ticket is already open with the same
+    description AND resolution is not resolved AND is assigned to the same user.
+
+    The username/assignee check is removed from the previous logic
+    since the assignee could be changed and we don't want to create duplcate jiras.
+    """
+    query = f"summary~'\"{task_name}\"' AND resolution = unresolved"
+    try:
+        res = client.search_issues(query)
+        logging.info(f"Jira Search Results: {res}")
+        if len(res) > 0:  # There is an existing JIRA
+            logging.info(f"Found an existing issue: {res[0].key}")
+            out = (True, res[0].key)
+        else:
+            logging.info("No existing issues found; will have to create one")
+            out = (False, "")
+    except jira.JIRAError as e:
+        logging.error(e)
+        out = (False, "")
+    return out
+
+
+def create_new_task(
+    client: jira.JIRA, task_name, username, description_text: str
+) -> bool:
+    try:
+        # TODO: Uncomment after sufficient Testing
+        # new_issue = client.create_issue(
+        #     project="AVX",
+        #     description=description_text,
+        #     summary=task_name,
+        #     issuetype={"name": "Task"},
+        #     components=[{"name": "E2E"}],
+        #     parent={"key": JIRA_PARENT_TASK_ID},
+        # )
+        # client.assign_issue(new_issue.key, username)
+        logging.info(f"Creating new issue for {username} with title {task_name}")
+        # logging.info(f"Creating {new_issue.key} for {username} with title {task_name}")
+    except jira.JIRAError as e:
+        logging.error(f"Could not create a new jira because: {e}")
+        return False
+    return True
+
+
+def generate_workflow_link(run_id: str) -> str:
+    return f"https://github.com/AviatrixDev/cloudn/actions/runs/{run_id}"
+
+
+def handle_ci_notifications(
+    client: jira.JIRA,
+    username: str,
+    testname: str,
+    outcome: str,
+) -> None:
+    task_name = f"e2e-ci-failure for {testname}"
+    exists, issue_id = check_if_existing_task_open(client, task_name, username)
+    check_mark = "\U00002705"
+    cross_mark = "\U0000274C"
+    if not exists:  # Create a new task if it doesn't exist
+        if outcome == "failure":
+            description_text = f"""
+            Last failure on build {build}:
+            [GitHub Actions Workflow]({generate_workflow_link(run_id)})
+            AMI ID: {ami_id}
+            Commit Hash: {git_commit_hash}
+            Your attention is requested to triage the test suite failure(s).
+            If the test is not stable, please remove the pytest marker so this test is not picked up during automated runs.
+            """
+            summary = f"{task_name}"
+            create_new_task(client, summary, username, description_text)
+    else:  # Update the existing task
+        if outcome == "success":
+            comment = f"""
+            {check_mark} Test suite {outcome} on build {build}. Link to workflow:
+            [GitHub Actions Workflow]({generate_workflow_link(run_id)})
+            AMI ID: {ami_id}
+            Commit Hash: {git_commit_hash}
+            """
+        else:
+            comment = f"""
+            {cross_mark} Test suite {outcome} on build {build}. Link to workflow:
+            [GitHub Actions Workflow]({generate_workflow_link(run_id)})
+            Your attention is requested to triage the test suite.
+            AMI ID: {ami_id}
+            Commit Hash: {git_commit_hash}
+            """
+
+        logging.info(
+            f"Found an existing issue {issue_id}. Adding another comment to it to capture this {outcome}."
+        )
+        add_comment(client, issue_id, comment)
+
+
+def main() -> None:
+    """
+    If there's no associated PR title (i.e., no PR associated with this notification),
+        the script handles CI notifications by extracting the username and test suite name from command-line arguments,
+        then it checks if an issue already exists for that test suite name.
+        If not, it creates a new issue.
+        Otherwise, it updates the existing one by adding another comment to it.
+    If there's a PR title associated with this notification,
+        the script extracts the JIRA issue ID from it and then checks for repeat comments related to that issue and build combination.
+        If found, it appends another failure comment to the existing one.
+        Otherwise, it creates a new comment for that issue.
+    """
+    try:
+        client = get_client()
+        if pr_title is None:  # No PR associated with this notification
+            username = sys.argv[1]
+            testname = sys.argv[2]
+            outcome = sys.argv[3]  # "success" or "failure"
+            regex = re.compile(r"[^a-zA-Z0-9_]+")  # Expecting only letters and numbers
+            assert not re.match(regex, username)
+            handle_ci_notifications(client, username, testname, outcome)
+        else:  # PR is associated with this notification
+            jira_issue = re.findall(r"AVX-[0-9]+", pr_title)
+            msg = sys.argv[1]
+            if len(jira_issue) == 0:
+                logging.error("No JIRA Issue found in the PR title")
+                sys.exit(1)
+            else:
+                issueid = jira_issue[0]
+
+            existing_comment_id = check_repeat_comment(client, issueid, msg)
+            if not existing_comment_id:
+                if add_comment(
+                    client,
+                    issueid,
+                    enrich_msg(msg, pr_number, pr_title, run_id, commit_sha),
+                ):
+                    logging.info("Posted comment successfully!")
+            else:
+                if append_repeat_failure(
+                    client, issueid, commit_sha, existing_comment_id, run_id
+                ):
+                    logging.info("Updated comment successfully!")
+    except AssertionError:
+        logging.error("Checks failed; not creating or updating Jiras!")
+
+
 
 class pytestrail(object):
     '''
@@ -150,7 +382,7 @@ def get_testrail_keys(items):
 class PyTestRailPlugin(object):
     def __init__(self, client, assign_user_id, project_id, suite_id, include_all, cert_check, tr_name,
                  tr_description='', run_id=0, plan_id=0, version='', close_on_complete=False,
-                 publish_blocked=True, skip_missing=False, milestone_id=None, custom_comment=None):
+                 publish_blocked=True, skip_missing=False, milestone_id=None, custom_comment=None, jira_owner=None, test_dirs=None):
         self.assign_user_id = assign_user_id
         self.cert_check = cert_check
         self.client = client
@@ -168,6 +400,17 @@ class PyTestRailPlugin(object):
         self.skip_missing = skip_missing
         self.milestone_id = milestone_id
         self.custom_comment = custom_comment
+        self.jira_owner = jira_owner
+        self.test_dirs = test_dirs
+
+    def jira(self) -> None:
+        try:
+            logger.info("Starting Jira creation")
+            logger.info(f"jira_owner: {self.jira_owner}")
+            logger.info("Starting Test Dirs creation")
+            logger.info(f"jira_owner: {self.test_dirs}")
+        except AssertionError:
+            logging.error("Checks failed; not creating or updating Jiras!")
 
     # pytest hooks
 
@@ -255,6 +498,7 @@ class PyTestRailPlugin(object):
     def pytest_sessionfinish(self, session, exitstatus):
         """Publish results in TestRail"""
         logger.info('[{}] Start publishing'.format(TESTRAIL_PREFIX))
+        self.jira()
         error = None
         if not self.results:
             logger.error('[{}] No test results to publish'.format(TESTRAIL_PREFIX))
@@ -616,3 +860,4 @@ class PyTestRailPlugin(object):
             print('[{}] Failed to get tests: "{}"'.format(TESTRAIL_PREFIX, error))
             return None
         return response
+    

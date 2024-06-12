@@ -121,6 +121,20 @@ def pytest_addoption(parser):
         help='Custom comment, to be appended to default comment for test case \
               (config file: custom_comment in TESTCASE section)'
     )
+    group.addoption(
+        '--jira-owner',
+        action='store',
+        default=None,
+        required=False,
+        help='Jira owner of the test case'
+    )
+    group.addoption(
+        '--test-dirs',
+        action='store',
+        default=None,
+        required=False,
+        help='Test directories to be included in the test run'
+    )
 
 
 def pytest_configure(config):
@@ -151,7 +165,9 @@ def pytest_configure(config):
                 publish_blocked=config.getoption('--tr-dont-publish-blocked'),
                 skip_missing=config.getoption('--tr-skip-missing'),
                 milestone_id=config_manager.getoption('tr-milestone-id', 'milestone_id', 'TESTRUN'),
-                custom_comment=config_manager.getoption('tc-custom-comment', 'custom_comment', 'TESTCASE')
+                custom_comment=config_manager.getoption('tc-custom-comment', 'custom_comment', 'TESTCASE'),
+                jira_owner=config_manager.getoption('jira-owner', 'owner', 'TESTCASE'),
+                test_dirs=config_manager.getoption('test-dirs', 'test_dirs', 'TESTRUN'),
             ),
             # Name of plugin instance (allow to be used by other plugins)
             name="pytest-testrail-instance"
