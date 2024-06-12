@@ -135,6 +135,13 @@ def pytest_addoption(parser):
         required=False,
         help='Test directories to be included in the test run'
     )
+    group.addoption(
+        '--gh-run-id',
+        action='store',
+        default=None,
+        required=False,
+        help='Github Run Identifier'
+    )
 
 
 def pytest_configure(config):
@@ -168,6 +175,7 @@ def pytest_configure(config):
                 custom_comment=config_manager.getoption('tc-custom-comment', 'custom_comment', 'TESTCASE'),
                 jira_owner=config_manager.getoption('jira-owner', 'owner', 'TESTCASE'),
                 test_dirs=config_manager.getoption('test-dirs', 'test_dirs', 'TESTRUN'),
+                gh_run_id=config_manager.getoption('gh-run-id', 'run_id', 'TESTRUN'),
             ),
             # Name of plugin instance (allow to be used by other plugins)
             name="pytest-testrail-instance"
