@@ -6,6 +6,9 @@ import logging
 import pytest
 import re
 import warnings
+import logging
+from datetime import datetime
+from typing import Union, Tuple
 
 # Reference: http://docs.gurock.com/testrail-api2/reference-statuses
 TESTRAIL_TEST_STATUS = {
@@ -50,238 +53,6 @@ class DeprecatedTestDecorator(DeprecationWarning):
 
 
 warnings.simplefilter(action='once', category=DeprecatedTestDecorator, lineno=0)
-
-import re
-import os
-import sys
-import logging
-from datetime import datetime
-from typing import Union, Tuple
-import jira  # pylint: disable=import-error
-
-JIRA_SERVER = "https://aviatrix.atlassian.net"
-JIRA_USERNAME = "devtools@aviatrix.com"
-JIRA_PARENT_TASK_ID = "AVX-47708"
-pr_title = os.environ.get("PR_TITLE")
-pr_number = os.environ.get("PR_NUMBER")
-commit_sha = os.environ.get("COMMIT_SHA")
-run_id = os.environ.get("RUN_ID")
-build = os.environ.get("build")
-ami_id = os.environ.get("ami_id")
-git_commit_hash = os.environ.get("git_commit_hash")
-
-logging.basicConfig(level=logging.INFO)
-
-
-def get_client() -> jira.JIRA:
-    user = JIRA_USERNAME
-    if os.environ.get("JIRA_TOKEN"):
-        token = os.environ.get("JIRA_TOKEN")
-    if token:
-        jira_client = jira.JIRA(JIRA_SERVER, basic_auth=(user, token))
-    return jira_client
-
-
-def add_comment(client: jira.JIRA, issueid: str, comment: str) -> bool:
-    """Add comment to an issue"""
-    try:
-        issue = client.issue(issueid)
-        client.add_comment(issue, comment)
-    except jira.JIRAError as e:
-        logging.exception(f"Unable to post comment to {issueid} {e}")
-        return False
-    return True
-
-
-def check_repeat_comment(client: jira.JIRA, issueid: str, msg: str) -> Union[str, None]:
-    list_of_comments = client.comments(issueid)
-    for comment in reversed(list_of_comments):
-        # reversed ^^ so that we find the last comment made first.
-        comment_id: str = comment.id
-        assert type(comment_id) == str
-        if (
-            msg in client.comment(issueid, comment_id).body
-            and client.comment(issueid, comment_id).author.emailAddress == JIRA_USERNAME
-        ):
-            return comment_id
-    return None
-
-
-def append_repeat_failure(
-    client: jira.JIRA, issueid: str, commit_sha: str, comment_id: str, run_id: str
-) -> bool:
-    comment_to_update = client.comment(issueid, comment_id)
-    time = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
-    new_body = f"""
-    * Test failure repeated @ {time} on commit {commit_sha[0:7]}
-      WORKFLOW_URL: https://github.com/AviatrixDev/cloudn/actions/runs/{run_id}
-    {comment_to_update.body}
-    """
-    try:
-        comment_to_update.update(body=new_body)
-    except jira.JIRAError as e:
-        logging.exception(f"Unable to update comment {comment_id} in issue {issueid}")
-        return False
-    return True
-
-
-def enrich_msg(msg, pr_number: str, pr_title: str, run_id: str, commit_sha: str) -> str:
-    regex = re.compile(r"^AVX-\d\d\d\d+:? (.*)")
-    title = re.search(regex, pr_title).groups()[0]
-    new_msg = f"""
-    {msg}
-    
-    PR-{pr_number}
-    COMMIT-SHA - {commit_sha[0:7]}
-    PR Title - {title}
-    WORKFLOW_URL - https://github.com/AviatrixDev/cloudn/actions/runs/{run_id}
-    """
-    return new_msg
-
-
-def check_if_existing_task_open(
-    client: jira.JIRA, task_name, username: str
-) -> Tuple[bool, str]:
-    """
-    This function will check if a jira ticket is already open with the same
-    description AND resolution is not resolved AND is assigned to the same user.
-
-    The username/assignee check is removed from the previous logic
-    since the assignee could be changed and we don't want to create duplcate jiras.
-    """
-    query = f"summary~'\"{task_name}\"' AND resolution = unresolved"
-    try:
-        res = client.search_issues(query)
-        logging.info(f"Jira Search Results: {res}")
-        if len(res) > 0:  # There is an existing JIRA
-            logging.info(f"Found an existing issue: {res[0].key}")
-            out = (True, res[0].key)
-        else:
-            logging.info("No existing issues found; will have to create one")
-            out = (False, "")
-    except jira.JIRAError as e:
-        logging.error(e)
-        out = (False, "")
-    return out
-
-
-def create_new_task(
-    client: jira.JIRA, task_name, username, description_text: str
-) -> bool:
-    try:
-        # TODO: Uncomment after sufficient Testing
-        # new_issue = client.create_issue(
-        #     project="AVX",
-        #     description=description_text,
-        #     summary=task_name,
-        #     issuetype={"name": "Task"},
-        #     components=[{"name": "E2E"}],
-        #     parent={"key": JIRA_PARENT_TASK_ID},
-        # )
-        # client.assign_issue(new_issue.key, username)
-        logging.info(f"Creating new issue for {username} with title {task_name}")
-        # logging.info(f"Creating {new_issue.key} for {username} with title {task_name}")
-    except jira.JIRAError as e:
-        logging.error(f"Could not create a new jira because: {e}")
-        return False
-    return True
-
-
-def generate_workflow_link(run_id: str) -> str:
-    return f"https://github.com/AviatrixDev/cloudn/actions/runs/{run_id}"
-
-
-def handle_ci_notifications(
-    client: jira.JIRA,
-    username: str,
-    testname: str,
-    outcome: str,
-) -> None:
-    task_name = f"e2e-ci-failure for {testname}"
-    exists, issue_id = check_if_existing_task_open(client, task_name, username)
-    check_mark = "\U00002705"
-    cross_mark = "\U0000274C"
-    if not exists:  # Create a new task if it doesn't exist
-        if outcome == "failure":
-            description_text = f"""
-            Last failure on build {build}:
-            [GitHub Actions Workflow]({generate_workflow_link(run_id)})
-            AMI ID: {ami_id}
-            Commit Hash: {git_commit_hash}
-            Your attention is requested to triage the test suite failure(s).
-            If the test is not stable, please remove the pytest marker so this test is not picked up during automated runs.
-            """
-            summary = f"{task_name}"
-            create_new_task(client, summary, username, description_text)
-    else:  # Update the existing task
-        if outcome == "success":
-            comment = f"""
-            {check_mark} Test suite {outcome} on build {build}. Link to workflow:
-            [GitHub Actions Workflow]({generate_workflow_link(run_id)})
-            AMI ID: {ami_id}
-            Commit Hash: {git_commit_hash}
-            """
-        else:
-            comment = f"""
-            {cross_mark} Test suite {outcome} on build {build}. Link to workflow:
-            [GitHub Actions Workflow]({generate_workflow_link(run_id)})
-            Your attention is requested to triage the test suite.
-            AMI ID: {ami_id}
-            Commit Hash: {git_commit_hash}
-            """
-
-        logging.info(
-            f"Found an existing issue {issue_id}. Adding another comment to it to capture this {outcome}."
-        )
-        add_comment(client, issue_id, comment)
-
-
-def main() -> None:
-    """
-    If there's no associated PR title (i.e., no PR associated with this notification),
-        the script handles CI notifications by extracting the username and test suite name from command-line arguments,
-        then it checks if an issue already exists for that test suite name.
-        If not, it creates a new issue.
-        Otherwise, it updates the existing one by adding another comment to it.
-    If there's a PR title associated with this notification,
-        the script extracts the JIRA issue ID from it and then checks for repeat comments related to that issue and build combination.
-        If found, it appends another failure comment to the existing one.
-        Otherwise, it creates a new comment for that issue.
-    """
-    try:
-        client = get_client()
-        if pr_title is None:  # No PR associated with this notification
-            username = sys.argv[1]
-            testname = sys.argv[2]
-            outcome = sys.argv[3]  # "success" or "failure"
-            regex = re.compile(r"[^a-zA-Z0-9_]+")  # Expecting only letters and numbers
-            assert not re.match(regex, username)
-            handle_ci_notifications(client, username, testname, outcome)
-        else:  # PR is associated with this notification
-            jira_issue = re.findall(r"AVX-[0-9]+", pr_title)
-            msg = sys.argv[1]
-            if len(jira_issue) == 0:
-                logging.error("No JIRA Issue found in the PR title")
-                sys.exit(1)
-            else:
-                issueid = jira_issue[0]
-
-            existing_comment_id = check_repeat_comment(client, issueid, msg)
-            if not existing_comment_id:
-                if add_comment(
-                    client,
-                    issueid,
-                    enrich_msg(msg, pr_number, pr_title, run_id, commit_sha),
-                ):
-                    logging.info("Posted comment successfully!")
-            else:
-                if append_repeat_failure(
-                    client, issueid, commit_sha, existing_comment_id, run_id
-                ):
-                    logging.info("Updated comment successfully!")
-    except AssertionError:
-        logging.error("Checks failed; not creating or updating Jiras!")
-
 
 
 class pytestrail(object):
@@ -382,7 +153,7 @@ def get_testrail_keys(items):
 class PyTestRailPlugin(object):
     def __init__(self, client, assign_user_id, project_id, suite_id, include_all, cert_check, tr_name,
                  tr_description='', run_id=0, plan_id=0, version='', close_on_complete=False,
-                 publish_blocked=True, skip_missing=False, milestone_id=None, custom_comment=None, jira_owner=None, test_dirs=None):
+                 publish_blocked=True, skip_missing=False, milestone_id=None, custom_comment=None, jira_owner=None, test_dirs=None, gh_run_id=None):
         self.assign_user_id = assign_user_id
         self.cert_check = cert_check
         self.client = client
@@ -402,6 +173,7 @@ class PyTestRailPlugin(object):
         self.custom_comment = custom_comment
         self.jira_owner = jira_owner
         self.test_dirs = test_dirs
+        self.gh_run_id = gh_run_id
 
     def jira(self) -> None:
         try:
@@ -507,12 +279,12 @@ class PyTestRailPlugin(object):
         tests_list = [str(result['case_id']) for result in self.results]
         logger.info('[{}] Testcases to publish: {}'.format(TESTRAIL_PREFIX, ', '.join(tests_list)))
         if self.testrun_id:
-            error = self.publish_results_for_run(self.testrun_id)
+            error = self.publish_results_for_run(self.testrun_id, run_id, gh_run_id=self.gh_run_id)
         elif self.testplan_id:
-            testruns = self.get_available_testruns(self.testplan_id)
+            testruns = self.get_available_testruns(self.testplan_id, gh_run_id=self.gh_run_id)
             logger.info('[{}] Testruns to update: {}'.format(TESTRAIL_PREFIX, ', '.join(map(str, testruns))))
             for testrun_id in testruns:
-                error = self.publish_results_for_run(testrun_id)
+                error = self.publish_results_for_run(testrun_id, gh_run_id=self.gh_run_id)
         else:
             logger.info('[{}] No data published'.format(TESTRAIL_PREFIX))
 
@@ -527,9 +299,9 @@ class PyTestRailPlugin(object):
             logger.info('[{}] End publishing'.format(TESTRAIL_PREFIX))
 
 
-    def publish_results_for_run(self, testrun_id):
+    def publish_results_for_run(self, testrun_id, gh_run_id=None):
         """Publish results for a specific test run"""
-        error = self.add_results(testrun_id)
+        error = self.add_results(testrun_id, gh_run_id)
         if error:
             terraform_errors = self.extract_terraform_errors(error)
             if terraform_errors:
@@ -549,7 +321,7 @@ class PyTestRailPlugin(object):
                 
                 valid_results = [result for result in self.results if result['case_id'] not in invalid_test_ids]
                 for invalid_test_id in invalid_test_ids:
-                    self.add_error_results(testrun_id, [invalid_test_id], error)
+                    self.add_error_results(testrun_id, [invalid_test_id], error, gh_run_id)
             return error
         else:
             print('[{}] Test results successfully published for testrun {}'.format(TESTRAIL_PREFIX, testrun_id))
@@ -608,7 +380,7 @@ class PyTestRailPlugin(object):
                 test_id, status, comment, defects, duration, test_parametrize))
 
 
-    def add_error_results(self, testrun_id, invalid_test_ids, error):
+    def add_error_results(self, testrun_id, invalid_test_ids, error, gh_run_id):
         """
         Add error results for test cases excluding the invalid test case IDs.
 
@@ -645,39 +417,36 @@ class PyTestRailPlugin(object):
             if error_response:
                 logger.error('[{}] Error adding result for case {}: "{}"'.format(TESTRAIL_PREFIX, result['case_id'], error_response))
 
-    def add_results(self, testrun_id):
+    def add_results(self, testrun_id, gh_run_id=None):
         """
-        Add results one by one to improve errors handling.
+        Add results one by one to improve error handling.
 
-        :param testrun_id: Id of the testrun to feed
-
+        :param testrun_id: ID of the test run to feed.
+        :param gh_run_id: GitHub Actions run ID.
         """
-        # unicode converter for compatibility of python 2 and 3
+        # Unicode converter for compatibility with Python 2 and 3
         try:
             converter = unicode
         except NameError:
             converter = lambda s, c: str(bytes(s, "utf-8"), c)
-        # Results are sorted by 'case_id' and by 'status_id' (worst result at the end)
 
-        # Comment sort by status_id due to issue with pytest-rerun failures,
-        # for details refer to issue https://github.com/allankp/pytest-testrail/issues/100
-        # self.results.sort(key=itemgetter('status_id'))
+        # Results are sorted by 'case_id'
         self.results.sort(key=itemgetter('case_id'))
 
-        # Manage case of "blocked" testcases
-        if self.publish_blocked is False:
-            print('[{}] Option "Don\'t publish blocked testcases" activated'.format(TESTRAIL_PREFIX))
+        # Manage case of "blocked" test cases
+        if not self.publish_blocked:
+            print('[{}] Option "Don\'t publish blocked test cases" activated'.format(TESTRAIL_PREFIX))
             blocked_tests_list = [
                 test.get('case_id') for test in self.get_tests(testrun_id)
                 if test.get('status_id') == TESTRAIL_TEST_STATUS["blocked"]
             ]
-            print('[{}] Blocked testcases excluded: {}'.format(TESTRAIL_PREFIX,
-                                                               ', '.join(str(elt) for elt in blocked_tests_list)))
+            print('[{}] Blocked test cases excluded: {}'.format(TESTRAIL_PREFIX,
+                                                                ', '.join(str(elt) for elt in blocked_tests_list)))
             self.results = [result for result in self.results if result.get('case_id') not in blocked_tests_list]
 
-        # prompt enabling include all test cases from test suite when creating test run
+        # Prompt enabling include all test cases from test suite when creating test run
         if self.include_all:
-            print('[{}] Option "Include all testcases from test suite for test run" activated'.format(TESTRAIL_PREFIX))
+            print('[{}] Option "Include all test cases from test suite for test run" activated'.format(TESTRAIL_PREFIX))
 
         # Publish results
         data = {'results': []}
@@ -697,14 +466,19 @@ class PyTestRailPlugin(object):
                     # Indent text to avoid string formatting by TestRail. Limit size of comment.
                     entry['comment'] += u"# Pytest result: #\n"
                     entry['comment'] += u'Log truncated\n...\n' if len(str(comment)) > COMMENT_SIZE_LIMIT else u''
-                    entry['comment'] += u"    " + converter(str(comment), "utf-8")[-COMMENT_SIZE_LIMIT:].replace('\n', '\n    ') # noqa
+                    entry['comment'] += u"    " + converter(str(comment), "utf-8")[-COMMENT_SIZE_LIMIT:].replace('\n', '\n    ')  # noqa
                 else:
                     # Indent text to avoid string formatting by TestRail. Limit size of comment.
                     entry['comment'] += u"# Pytest result: #\n"
                     entry['comment'] += u'Log truncated\n...\n' if len(str(comment)) > COMMENT_SIZE_LIMIT else u''
-                    entry['comment'] += u"    " + converter(str(comment), "utf-8")[-COMMENT_SIZE_LIMIT:].replace('\n', '\n    ') # noqa
+                    entry['comment'] += u"    " + converter(str(comment), "utf-8")[-COMMENT_SIZE_LIMIT:].replace('\n', '\n    ')  # noqa
             elif comment == '':
                 entry['comment'] = self.custom_comment
+
+            if gh_run_id:
+                workflow_url = f"https://github.com/test/cloudn/actions/runs/{gh_run_id}"
+                entry['comment'] += f"\nGitHub Actions run URL: {workflow_url}"
+
             duration = result.get('duration')
             if duration:
                 duration = 1 if (duration < 1) else int(round(duration))  # TestRail API doesn't manage milliseconds
