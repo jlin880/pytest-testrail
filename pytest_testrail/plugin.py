@@ -279,7 +279,7 @@ class PyTestRailPlugin(object):
         tests_list = [str(result['case_id']) for result in self.results]
         logger.info('[{}] Testcases to publish: {}'.format(TESTRAIL_PREFIX, ', '.join(tests_list)))
         if self.testrun_id:
-            error = self.publish_results_for_run(self.testrun_id, run_id, gh_run_id=self.gh_run_id)
+            error = self.publish_results_for_run(self.testrun_id, gh_run_id=self.gh_run_id)
         elif self.testplan_id:
             testruns = self.get_available_testruns(self.testplan_id, gh_run_id=self.gh_run_id)
             logger.info('[{}] Testruns to update: {}'.format(TESTRAIL_PREFIX, ', '.join(map(str, testruns))))
