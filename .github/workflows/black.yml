@@ -23,10 +23,14 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install black
-        run: pip install black
+      - name: Install linters
+        run: pip install black pylint
 
       - name: Black changed files
         if: steps.changed-files.outputs.any_changed == 'true'
         run: |
           black --check ${{ steps.changed-files.outputs.all_changed_files }}
+
+      - name: Pylint all Python files
+        run: |
+          pylint $(git ls-files '*.py')
