@@ -1,0 +1,32 @@
+name: Black (python)
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@a0585ff9904b77d046192a7846e59783d6ea287b
+        with:
+          files: "**/*.py"
+
+      - name: Setup Python env
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install linters
+        run: pip install black pylint
+
+      - name: Black changed files
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          black --check ${{ steps.changed-files.outputs.all_changed_files }}
