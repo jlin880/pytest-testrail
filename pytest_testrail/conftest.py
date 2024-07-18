@@ -156,11 +156,74 @@ def pytest_addoption(parser):
         help="Test directories to be included in the test run",
     )
     group.addoption(
-        "--gh-run-id",
+        "--pr-title",
         action="store",
         default=None,
         required=False,
-        help="Github Run Identifier",
+        help="PR Title",
+    )
+    group.addoption(
+        "--pr-number",
+        action="store",
+        default=None,
+        required=False,
+        help="PR Number",
+    )
+    group.addoption(
+        "--github-commit-sha",
+        action="store",
+        default=None,
+        required=False,
+        help="GitHub Commit SHA",
+    )
+    group.addoption(
+        "--github-run-id",
+        action="store",
+        default=None,
+        required=False,
+        help="GitHub Run ID",
+    )
+    group.addoption(
+        "--controller-build-version",
+        action="store",
+        default=None,
+        required=False,
+        help="Controller Build Version",
+    )
+    group.addoption(
+        "--controller-ami-id",
+        action="store",
+        default=None,
+        required=False,
+        help="Controller AMI ID",
+    )
+    group.addoption(
+        "--git-commit-hash",
+        action="store",
+        default=None,
+        required=False,
+        help="Git Commit Hash",
+    )
+    group.addoption(
+        "--jira-server",
+        action="store",
+        default=None,
+        required=False,
+        help="Jira Server URL",
+    )
+    group.addoption(
+        "--jira-username",
+        action="store",
+        default=None,
+        required=False,
+        help="Jira Username",
+    )
+    group.addoption(
+        "--jira-parent-task-id",
+        action="store",
+        default=None,
+        required=False,
+        help="Jira Parent Task ID",
     )
 
 
@@ -218,8 +281,34 @@ def pytest_configure(config):
                     "tc-custom-comment", "custom_comment", "TESTCASE"
                 ),
                 jira_owner=config_manager.getoption("jira-owner", "owner", "TESTCASE"),
-                test_dirs=config_manager.getoption("test-dirs", "test_dirs", "TESTRUN"),
-                gh_run_id=config_manager.getoption("gh-run-id", "run_id", "TESTRUN"),
+                test_dirs=config_manager.getoption(
+                    "test-dirs", "test_dirs", "TESTCASE"
+                ),
+                pr_title=config_manager.getoption("pr-title", "pr_title", "TESTCASE"),
+                pr_number=config_manager.getoption(
+                    "pr-number", "pr_number", "TESTCASE"
+                ),
+                github_commit_sha=config_manager.getoption(
+                    "github-commit-sha", "github_commit_sha", "TESTCASE"
+                ),
+                github_run_id=config_manager.getoption(
+                    "github-run-id", "github_run_id", "TESTCASE"
+                ),
+                controller_build_version=config_manager.getoption(
+                    "controller-build-version", "controller_build_version", "TESTCASE"
+                ),
+                controller_ami_id=config_manager.getoption(
+                    "controller-ami-id", "controller_ami_id", "TESTCASE"
+                ),
+                jira_server=config_manager.getoption(
+                    "jira-server", "jira_server", "TESTCASE"
+                ),
+                jira_username=config_manager.getoption(
+                    "jira-username", "jira_username", "TESTCASE"
+                ),
+                jira_parent_task_id=config_manager.getoption(
+                    "jira-parent-task-id", "jira_parent_task_id", "TESTCASE"
+                ),
             ),
             # Name of plugin instance (allow to be used by other plugins)
             name="pytest-testrail-instance",

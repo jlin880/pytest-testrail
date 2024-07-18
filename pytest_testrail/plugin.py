@@ -2,9 +2,11 @@
 from datetime import datetime
 from operator import itemgetter
 
-import logging
+import jira
+import os
 import pytest
 import re
+import sys
 import warnings
 import logging
 from datetime import datetime
@@ -181,7 +183,15 @@ class PyTestRailPlugin(object):
         custom_comment=None,
         jira_owner=None,
         test_dirs=None,
-        gh_run_id=None,
+        pr_title=None,
+        pr_number=None,
+        github_commit_sha=None,
+        github_run_id=None,
+        controller_build_version=None,
+        controller_ami_id=None,
+        jira_server=None,
+        jira_username=None,
+        jira_parent_task_id=None,
     ):
         self.assign_user_id = assign_user_id
         self.cert_check = cert_check
@@ -202,16 +212,244 @@ class PyTestRailPlugin(object):
         self.custom_comment = custom_comment
         self.jira_owner = jira_owner
         self.test_dirs = test_dirs
-        self.gh_run_id = gh_run_id
+        self.pr_title = pr_title
+        self.pr_number = pr_number
+        self.github_commit_sha = github_commit_sha
+        self.github_run_id = github_run_id
+        self.controller_build_version = controller_build_version
+        self.controller_ami_id = controller_ami_id
+        self.jira_server = jira_server
+        self.jira_username = jira_username
+        self.jira_parent_task_id = jira_parent_task_id
 
-    def jira(self) -> None:
+    def set_github_env_var(self, var_name, var_value):
+        os.environ[var_name] = var_value
+        env_file = os.getenv("GITHUB_ENV")
+        if env_file:
+            with open(env_file, "a") as envfile:
+                envfile.write(f"{var_name}={var_value}\n")
+        else:
+            logging.error("GITHUB_ENV environment variable is not set")
+
+    def get_client(self) -> jira.JIRA:
+        user = self.jira_username
+        if os.environ.get("JIRA_TOKEN"):
+            token = os.environ.get("JIRA_TOKEN")
+        if token:
+            jira_client = jira.JIRA(self.jira_server, basic_auth=(user, token))
+        return jira_client
+
+    def add_comment(self, client: jira.JIRA, issue_id: str, comment: str) -> bool:
+        """Add comment to an issue"""
         try:
-            logger.info("Starting Jira creation")
-            logger.info(f"jira_owner: {self.jira_owner}")
-            logger.info("Starting Test Dirs creation")
-            logger.info(f"jira_owner: {self.test_dirs}")
+            issue = client.issue(issue_id)
+            client.add_comment(issue, comment)
+        except jira.JIRAError as e:
+            logging.exception(f"Unable to post comment to {issue_id} {e}")
+            return False
+        return True
+
+    def check_repeat_comment(
+        self, client: jira.JIRA, issue_id: str, msg: str
+    ) -> Union[str, None]:
+        list_of_comments = client.comments(issue_id)
+        for comment in reversed(list_of_comments):
+            # reversed ^^ so that we find the last comment made first.
+            comment_id: str = comment.id
+            assert type(comment_id) == str
+            if (
+                msg in client.comment(issue_id, comment_id).body
+                and client.comment(issue_id, comment_id).author.emailAddress
+                == self.jira_username
+            ):
+                return comment_id
+        return None
+
+    def append_repeat_failure(
+        self,
+        client: jira.JIRA,
+        issue_id: str,
+        github_commit_sha: str,
+        comment_id: str,
+        github_run_id: str,
+    ) -> bool:
+        comment_to_update = client.comment(issue_id, comment_id)
+        time = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+        new_body = f"""
+        * Test failure repeated @ {time} on commit {github_commit_sha[0:7]}
+        WORKFLOW_URL: https://github.com/AviatrixDev/cloudn/actions/runs/{github_run_id}
+        {comment_to_update.body}
+        """
+        try:
+            comment_to_update.update(body=new_body)
+        except jira.JIRAError as e:
+            logging.exception(
+                f"Unable to update comment {comment_id} in issue {issue_id}"
+            )
+            return False
+        return True
+
+    def enrich_msg(
+        self,
+        msg,
+        pr_number: str,
+        pr_title: str,
+        github_run_id: str,
+        github_commit_sha: str,
+    ) -> str:
+        regex = re.compile(r"^AVX-\d\d\d\d+:? (.*)")
+        title = re.search(regex, pr_title).groups()[0]
+        new_msg = f"""
+        {msg}
+        
+        PR-{pr_number}
+        COMMIT-SHA - {github_commit_sha[0:7]}
+        PR Title - {title}
+        WORKFLOW_URL - https://github.com/AviatrixDev/cloudn/actions/runs/{github_run_id}
+        """
+        return new_msg
+
+    def check_if_existing_task_open(
+        self, client: jira.JIRA, task_name, username: str
+    ) -> Tuple[bool, str]:
+        query = f"summary~'\"{task_name}\"' AND resolution = unresolved"
+        try:
+            res = client.search_issues(query)
+            logging.info(f"Jira Search Results: {res}")
+            if len(res) > 0:  # There is an existing JIRA
+                logging.info(f"Found an existing issue: {res[0].key}")
+                out = (True, res[0].key)
+            else:
+                logging.info("No existing issues found; will have to create one")
+                out = (False, "")
+        except jira.JIRAError as e:
+            logging.error(e)
+            out = (False, "")
+        return out
+
+    def create_new_task(
+        self, client: jira.JIRA, task_name, username, description_text: str
+    ) -> bool:
+        try:
+            issue_id = client.create_issue(
+                project={"key": "QE"},
+                description=description_text,
+                summary=task_name,
+                issuetype={"name": "Task"},
+                components=[{"name": "e2e"}],
+                parent={"key": self.jira_parent_task_id},
+            )
+            client.assign_issue(issue_id.key, username)
+            logging.info(f"Creating new issue for {username} with title {task_name}")
+            # logging.info(f"Creating {issue_id.key} for {username} with title {task_name}")
+        except jira.JIRAError as e:
+            logging.error(f"Could not create a new jira because: {e}")
+            return None
+        return issue_id
+
+    def generate_workflow_link(self, github_run_id: str) -> str:
+        return f"https://github.com/AviatrixDev/cloudn/actions/runs/{github_run_id}"
+
+    def handle_ci_notifications(
+        self,
+        client: jira.JIRA,
+        username: str,
+        testname: str,
+        outcome: str,
+        git_commit_sha: str,
+    ) -> None:
+        task_name = f"e2e-ci-failure for {testname}"
+        exists, issue_id = self.check_if_existing_task_open(client, task_name, username)
+        check_mark = "\U00002705"
+        cross_mark = "\U0000274C"
+        if not exists:  # Create a new task if it doesn't exist
+            if outcome == "failure":
+                description_text = f"""
+                Last failure on ontroller Build Version {self.controller_build_version}:
+                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
+                AMI ID: {self.controller_ami_id}
+                Github Commit SHA: {git_commit_sha}
+                Your attention is requested to triage the test suite failure(s).
+                If the test is not stable, please remove the pytest marker so this test is not picked up during automated runs.
+                """
+                summary = f"{task_name}"
+                issue_id = self.create_new_task(
+                    client, summary, username, description_text
+                )
+        else:  # Update the existing task
+            if outcome == "success":
+                comment = f"""
+                {check_mark} Test suite {outcome} on Controller Build Version {self.controller_build_version}. Link to workflow:
+                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
+                AMI ID: {self.controller_ami_id}
+                Github Commit SHA: {git_commit_sha}
+                """
+            else:
+                comment = f"""
+                {cross_mark} Test suite {outcome} on Controller Build Version {self.controller_build_version}. Link to workflow:
+                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
+                Your attention is requested to triage the test suite.
+                AMI ID: {self.controller_ami_id}
+                Github Commit SHA: {git_commit_sha}
+                """
+
+            logging.info(
+                f"Found an existing issue {issue_id}. Adding another comment to it to capture this {outcome}."
+            )
+            self.add_comment(client, issue_id, comment)
+        return issue_id
+
+    def jira(self) -> str:
+        try:
+            client = self.get_client()
+            if self.pr_title is None:  # No PR associated with this notification
+                username = sys.argv[1]
+                testname = sys.argv[2]
+                outcome = sys.argv[3]  # "success" or "failure"
+                regex = re.compile(
+                    r"[^a-zA-Z0-9_]+"
+                )  # Expecting only letters and numbers
+                assert not re.match(regex, username)
+                issue_id = self.handle_ci_notifications(
+                    client, username, testname, outcome, self.github_commit_sha
+                )
+            else:  # PR is associated with this notification
+                jira_issue = re.findall(r"AVX-[0-9]+", self.pr_title)
+                msg = sys.argv[1]
+                if len(jira_issue) == 0:
+                    logging.error("No JIRA Issue found in the PR title")
+                    sys.exit(1)
+                else:
+                    issue_id = jira_issue[0]
+
+                existing_comment_id = self.check_repeat_comment(client, issue_id, msg)
+                if not existing_comment_id:
+                    if self.add_comment(
+                        client,
+                        issue_id,
+                        self.enrich_msg(
+                            msg,
+                            self.pr_number,
+                            self.pr_title,
+                            self.github_run_id,
+                            self.github_commit_sha,
+                        ),
+                    ):
+                        logging.info("Posted comment successfully!")
+                else:
+                    if self.append_repeat_failure(
+                        client,
+                        issue_id,
+                        self.github_commit_sha,
+                        existing_comment_id,
+                        self.github_run_id,
+                    ):
+                        logging.info("Updated comment successfully!")
+            self.set_github_env_var("ISSUE_ID", issue_id)
+            return issue_id
         except AssertionError:
             logging.error("Checks failed; not creating or updating Jiras!")
+            return ""
 
     # pytest hooks
 
@@ -318,11 +556,11 @@ class PyTestRailPlugin(object):
         )
         if self.testrun_id:
             error = self.publish_results_for_run(
-                self.testrun_id, gh_run_id=self.gh_run_id
+                self.testrun_id, github_run_id=self.github_run_id
             )
         elif self.testplan_id:
             testruns = self.get_available_testruns(
-                self.testplan_id, gh_run_id=self.gh_run_id
+                self.testplan_id, github_run_id=self.github_run_id
             )
             logger.info(
                 "[{}] Testruns to update: {}".format(
@@ -331,7 +569,7 @@ class PyTestRailPlugin(object):
             )
             for testrun_id in testruns:
                 error = self.publish_results_for_run(
-                    testrun_id, gh_run_id=self.gh_run_id
+                    testrun_id, github_run_id=self.github_run_id
                 )
         else:
             logger.info("[{}] No data published".format(TESTRAIL_PREFIX))
@@ -352,9 +590,9 @@ class PyTestRailPlugin(object):
         else:
             logger.info("[{}] End publishing".format(TESTRAIL_PREFIX))
 
-    def publish_results_for_run(self, testrun_id, gh_run_id=None):
+    def publish_results_for_run(self, testrun_id, github_run_id=None):
         """Publish results for a specific test run"""
-        error = self.add_results(testrun_id, gh_run_id)
+        error = self.add_results(testrun_id, github_run_id)
         if error:
             terraform_errors = self.extract_terraform_errors(error)
             if terraform_errors:
@@ -389,7 +627,7 @@ class PyTestRailPlugin(object):
                 ]
                 for invalid_test_id in invalid_test_ids:
                     self.add_error_results(
-                        testrun_id, [invalid_test_id], error, gh_run_id
+                        testrun_id, [invalid_test_id], error, github_run_id
                     )
             return error
         else:
@@ -466,7 +704,7 @@ class PyTestRailPlugin(object):
                 )
             )
 
-    def add_error_results(self, testrun_id, invalid_test_ids, error, gh_run_id):
+    def add_error_results(self, testrun_id, invalid_test_ids, error, github_run_id):
         """
         Add error results for test cases excluding the invalid test case IDs.
 
@@ -519,12 +757,12 @@ class PyTestRailPlugin(object):
                     )
                 )
 
-    def add_results(self, testrun_id, gh_run_id=None):
+    def add_results(self, testrun_id, github_run_id=None):
         """
         Add results one by one to improve error handling.
 
         :param testrun_id: ID of the test run to feed.
-        :param gh_run_id: GitHub Actions run ID.
+        :param github_run_id: GitHub Actions run ID.
         """
         # Unicode converter for compatibility with Python 2 and 3
         try:
@@ -613,9 +851,9 @@ class PyTestRailPlugin(object):
             elif comment == "":
                 entry["comment"] = self.custom_comment
 
-            if gh_run_id:
+            if github_run_id:
                 workflow_url = (
-                    f"https://github.com/test/cloudn/actions/runs/{gh_run_id}"
+                    f"https://github.com/test/cloudn/actions/runs/{github_run_id}"
                 )
                 entry["comment"] += f"\nGitHub Actions run URL: {workflow_url}"
 
