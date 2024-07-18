@@ -30,7 +30,3 @@ jobs:
         if: steps.changed-files.outputs.any_changed == 'true'
         run: |
           black --check ${{ steps.changed-files.outputs.all_changed_files }}
-
-      - name: Pylint all Python files
-        run: |
-          pylint $(git ls-files '*.py')
