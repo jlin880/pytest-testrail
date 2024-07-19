@@ -45,8 +45,8 @@ CLOSE_TESTPLAN_URL = "close_plan/{}"
 GET_TESTRUN_URL = "get_run/{}"
 GET_TESTPLAN_URL = "get_plan/{}"
 GET_TESTS_URL = "get_tests/{}"
-
 COMMENT_SIZE_LIMIT = 4000
+RESULTS_FILE_PATH = "/home/ubuntu/test_results.txt"
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -317,7 +317,7 @@ class PyTestRailPlugin(object):
         return new_msg
 
     def check_if_existing_task_open(
-        self, client: jira.JIRA, task_name, username: str
+        self, client: jira.JIRA, task_name
     ) -> Tuple[bool, str]:
         query = f"summary~'\"{task_name}\"' AND resolution = unresolved"
         try:
@@ -366,11 +366,7 @@ class PyTestRailPlugin(object):
         git_commit_sha: str,
     ) -> None:
         task_name = f"e2e-ci-failure for {testname}"
-        exists, self.issue_id = self.check_if_existing_task_open(
-            client, task_name, username
-        )
-        check_mark = "\U00002705"
-        cross_mark = "\U0000274C"
+        exists, self.issue_id = self.check_if_existing_task_open(client, task_name)
         if not exists:  # Create a new task if it doesn't exist
             if outcome == "failure":
                 description_text = f"""
@@ -385,27 +381,6 @@ class PyTestRailPlugin(object):
                 self.issue_id = self.create_new_task(
                     client, summary, username, description_text
                 )
-        else:  # Update the existing task
-            if outcome == "success":
-                context = f"""
-                {check_mark} Test suite {outcome} on Controller Build Version {self.controller_build_version}. Link to workflow:
-                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
-                AMI ID: {self.controller_ami_id}
-                Github Commit SHA: {git_commit_sha}
-                """
-            else:
-                context = f"""
-                {cross_mark} Test suite {outcome} on Controller Build Version {self.controller_build_version}. Link to workflow:
-                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
-                Your attention is requested to triage the test suite.
-                AMI ID: {self.controller_ami_id}
-                Github Commit SHA: {git_commit_sha}
-                """
-
-            logging.info(
-                f"Found an existing issue {self.issue_id}. Adding another context to it to capture this {outcome}."
-            )
-            self.add_context(client, self.issue_id, context)
         return self.issue_id
 
     def jira(self, outcome: str) -> str:
@@ -525,13 +500,13 @@ class PyTestRailPlugin(object):
         if not self.results:
             logger.warning("[{}] No test results to publish".format(TESTRAIL_PREFIX))
             raise Exception("No test results to publish in TestRail")
-        logger.info(f"Test Results: {self.results}")
         for result in self.results:
-            logger.info(f"Test Result: {result}\n")
             if result["status_id"] != 1:
                 result["defects"] = self.issue_id
         tests_list = [str(result["case_id"]) for result in self.results]
-        logger.info(f"Test formatted_results: {self.results}")
+        with open(RESULTS_FILE_PATH, "w") as file:
+            file.write(str(self.results))
+        logger.info(f"Test results saved to: {RESULTS_FILE_PATH}")
         logger.info(
             "[{}] Testcases to publish: {}".format(
                 TESTRAIL_PREFIX, ", ".join(tests_list)
