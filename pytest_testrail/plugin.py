@@ -527,7 +527,9 @@ class PyTestRailPlugin(object):
             raise Exception("No test results to publish in TestRail")
         logger.info(f"Test Results: {self.results}")
         for result in self.results:
-            result["defects"] = self.issue_id
+            logger.info(f"Test Result: {result}\n")
+            if result["status_id"] != 1:
+                result["defects"] = self.issue_id
         tests_list = [str(result["case_id"]) for result in self.results]
         logger.info(f"Test formatted_results: {self.results}")
         logger.info(
