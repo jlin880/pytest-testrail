@@ -2,9 +2,15 @@
 from datetime import datetime
 from operator import itemgetter
 
+import jira
+import os
 import pytest
 import re
+import sys
 import warnings
+import logging
+from datetime import datetime
+from typing import Union, Tuple
 
 # Reference: http://docs.gurock.com/testrail-api2/reference-statuses
 TESTRAIL_TEST_STATUS = {
@@ -13,12 +19,19 @@ TESTRAIL_TEST_STATUS = {
     "untested": 3,
     "retest": 4,
     "failed": 5,
+    "deferred": 6,
+    "NA": 7,
+    "terraformerror": 8,
 }
 
+# Update the mapping for pytest outcomes
 PYTEST_TO_TESTRAIL_STATUS = {
     "passed": TESTRAIL_TEST_STATUS["passed"],
     "failed": TESTRAIL_TEST_STATUS["failed"],
     "skipped": TESTRAIL_TEST_STATUS["blocked"],
+    "deferred": TESTRAIL_TEST_STATUS["deferred"],
+    "NA": TESTRAIL_TEST_STATUS["NA"],
+    "terraformerror": TESTRAIL_TEST_STATUS["terraformerror"],
 }
 
 DT_FORMAT = "%d-%m-%Y %H:%M:%S"
@@ -34,6 +47,9 @@ GET_TESTPLAN_URL = "get_plan/{}"
 GET_TESTS_URL = "get_tests/{}"
 
 COMMENT_SIZE_LIMIT = 4000
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class DeprecatedTestDecorator(DeprecationWarning):
@@ -165,6 +181,18 @@ class PyTestRailPlugin(object):
         skip_missing=False,
         milestone_id=None,
         custom_comment=None,
+        jira_owner=None,
+        test_dirs=None,
+        pr_title=None,
+        pr_number=None,
+        github_commit_sha=None,
+        github_run_id=None,
+        controller_build_version=None,
+        controller_ami_id=None,
+        jira_server=None,
+        jira_username=None,
+        jira_parent_task_id=None,
+        jira_token=None,
     ):
         self.assign_user_id = assign_user_id
         self.cert_check = cert_check
@@ -183,6 +211,220 @@ class PyTestRailPlugin(object):
         self.skip_missing = skip_missing
         self.milestone_id = milestone_id
         self.custom_comment = custom_comment
+        self.jira_owner = jira_owner
+        self.test_dirs = test_dirs
+        self.pr_title = pr_title
+        self.pr_number = pr_number
+        self.github_commit_sha = github_commit_sha
+        self.github_run_id = github_run_id
+        self.controller_build_version = controller_build_version
+        self.controller_ami_id = controller_ami_id
+        self.jira_server = jira_server
+        self.jira_username = jira_username
+        self.jira_parent_task_id = jira_parent_task_id
+        self.jira_token = jira_token
+        self.issue_id = ""
+
+    def set_github_env_var(self, var_name, var_value):
+        os.environ[var_name] = var_value
+        env_file = os.getenv("GITHUB_ENV")
+        if env_file:
+            with open(env_file, "a") as envfile:
+                envfile.write(f"{var_name}={var_value}\n")
+        else:
+            logging.error("GITHUB_ENV environment variable is not set")
+
+    def get_client(self) -> jira.JIRA:
+        user = self.jira_username
+        token = self.jira_token
+        jira_client = None
+        if token:
+            jira_client = jira.JIRA(self.jira_server, basic_auth=(user, token))
+        else:
+            logging.error(
+                "JIRA_TOKEN is not set, unable to create or update jira ticket"
+            )
+        return jira_client
+
+    def add_context(self, client: jira.JIRA, issue_id: str, context: str) -> bool:
+        """Add context to an issue"""
+        try:
+            issue = client.issue(self.issue_id)
+            client.add_comment(issue, context)
+        except jira.JIRAError as e:
+            logging.exception(f"Unable to post context to {self.issue_id} {e}")
+            return False
+        return True
+
+    def check_repeat_context(
+        self, client: jira.JIRA, issue_id: str, msg: str
+    ) -> Union[str, None]:
+        list_of_contexts = client.contexts(self.issue_id)
+        for context in reversed(list_of_contexts):
+            # reversed ^^ so that we find the last context made first.
+            context_id: str = context.id
+            assert type(context_id) == str
+            if (
+                msg in client.context(self.issue_id, context_id).body
+                and client.context(self.issue_id, context_id).author.emailAddress
+                == self.jira_username
+            ):
+                return context_id
+        return None
+
+    def append_repeat_failure(
+        self,
+        client: jira.JIRA,
+        issue_id: str,
+        github_commit_sha: str,
+        context_id: str,
+        github_run_id: str,
+    ) -> bool:
+        context_to_update = client.context(self.issue_id, context_id)
+        time = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
+        new_body = f"""
+        * Test failure repeated @ {time} on commit {github_commit_sha[0:7]}
+        WORKFLOW_URL: https://github.com/AviatrixDev/cloudn/actions/runs/{github_run_id}
+        {context_to_update.body}
+        """
+        try:
+            context_to_update.update(body=new_body)
+        except jira.JIRAError as e:
+            logging.exception(
+                f"Unable to update context {context_id} in issue {self.issue_id}"
+            )
+            return False
+        return True
+
+    def enrich_msg(
+        self,
+        msg,
+        pr_number: str,
+        pr_title: str,
+        github_run_id: str,
+        github_commit_sha: str,
+    ) -> str:
+        regex = re.compile(r"^AVX-\d\d\d\d+:? (.*)")
+        title = re.search(regex, pr_title).groups()[0]
+        new_msg = f"""
+        {msg}
+        
+        PR-{pr_number}
+        COMMIT-SHA - {github_commit_sha[0:7]}
+        PR Title - {title}
+        WORKFLOW_URL - https://github.com/AviatrixDev/cloudn/actions/runs/{github_run_id}
+        """
+        return new_msg
+
+    def check_if_existing_task_open(
+        self, client: jira.JIRA, task_name, username: str
+    ) -> Tuple[bool, str]:
+        query = f"summary~'\"{task_name}\"' AND resolution = unresolved"
+        try:
+            res = client.search_issues(query)
+            logging.info(f"Jira Search Results: {res}")
+            if len(res) > 0:  # There is an existing JIRA
+                logging.info(f"Found an existing issue: {res[0].key}")
+                out = (True, res[0].key)
+            else:
+                logging.info("No existing issues found; will have to create one")
+                out = (False, "")
+        except jira.JIRAError as e:
+            logging.error(e)
+            out = (False, "")
+        return out
+
+    def create_new_task(
+        self, client: jira.JIRA, task_name, username, description_text: str
+    ) -> bool:
+        try:
+            self.issue_id = client.create_issue(
+                project={"key": "QE"},
+                description=description_text,
+                summary=task_name,
+                issuetype={"name": "Task"},
+                components=[{"name": "e2e"}],
+                parent={"key": self.jira_parent_task_id},
+            )
+            client.assign_issue(self.issue_id.key, username)
+            logging.info(f"Creating new issue for {username} with title {task_name}")
+            # logging.info(f"Creating {self.issue_id.key} for {username} with title {task_name}")
+        except jira.JIRAError as e:
+            logging.error(f"Could not create a new jira because: {e}")
+            return None
+        return self.issue_id
+
+    def generate_workflow_link(self, github_run_id: str) -> str:
+        return f"https://github.com/AviatrixDev/cloudn/actions/runs/{github_run_id}"
+
+    def handle_ci_notifications(
+        self,
+        client: jira.JIRA,
+        username: str,
+        testname: str,
+        outcome: str,
+        git_commit_sha: str,
+    ) -> None:
+        task_name = f"e2e-ci-failure for {testname}"
+        exists, self.issue_id = self.check_if_existing_task_open(
+            client, task_name, username
+        )
+        check_mark = "\U00002705"
+        cross_mark = "\U0000274C"
+        if not exists:  # Create a new task if it doesn't exist
+            if outcome == "failure":
+                description_text = f"""
+                Last failure on ontroller Build Version {self.controller_build_version}:
+                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
+                AMI ID: {self.controller_ami_id}
+                Github Commit SHA: {git_commit_sha}
+                Your attention is requested to triage the test suite failure(s).
+                If the test is not stable, please remove the pytest marker so this test is not picked up during automated runs.
+                """
+                summary = f"{task_name}"
+                self.issue_id = self.create_new_task(
+                    client, summary, username, description_text
+                )
+        else:  # Update the existing task
+            if outcome == "success":
+                context = f"""
+                {check_mark} Test suite {outcome} on Controller Build Version {self.controller_build_version}. Link to workflow:
+                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
+                AMI ID: {self.controller_ami_id}
+                Github Commit SHA: {git_commit_sha}
+                """
+            else:
+                context = f"""
+                {cross_mark} Test suite {outcome} on Controller Build Version {self.controller_build_version}. Link to workflow:
+                [GitHub Actions Workflow]({self.generate_workflow_link(self.github_run_id)})
+                Your attention is requested to triage the test suite.
+                AMI ID: {self.controller_ami_id}
+                Github Commit SHA: {git_commit_sha}
+                """
+
+            logging.info(
+                f"Found an existing issue {self.issue_id}. Adding another context to it to capture this {outcome}."
+            )
+            self.add_context(client, self.issue_id, context)
+        return self.issue_id
+
+    def jira(self, outcome: str) -> str:
+        try:
+            client = self.get_client()
+            username = self.jira_owner
+            testname = self.test_dirs
+            regex = re.compile(r"[^a-zA-Z0-9_]+")  # Expecting only letters and numbers
+            logger.info("username" + username)
+            logger.info("testname" + testname)
+            self.issue_id = self.handle_ci_notifications(
+                client, username, testname, outcome, self.github_commit_sha
+            )
+
+            self.set_github_env_var("self.issue_id", self.issue_id)
+            return self.issue_id
+        except AssertionError:
+            logging.error("Checks failed; not creating or updating Jiras!")
+            return ""
 
     # pytest hooks
 
@@ -218,16 +460,17 @@ class PyTestRailPlugin(object):
             if self.testrun_name is None:
                 self.testrun_name = testrun_name()
 
-            self.create_test_run(
-                self.assign_user_id,
-                self.project_id,
-                self.suite_id,
-                self.include_all,
-                self.testrun_name,
-                tr_keys,
-                self.milestone_id,
-                self.testrun_description,
-            )
+            if self.testrun_id is None:
+                self.create_test_run(
+                    self.assign_user_id,
+                    self.project_id,
+                    self.suite_id,
+                    self.include_all,
+                    self.testrun_name,
+                    tr_keys,
+                    self.milestone_id,
+                    self.testrun_description,
+                )
 
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
     def pytest_runtest_makereport(self, item, call):
@@ -246,7 +489,7 @@ class PyTestRailPlugin(object):
             )
         if item.get_closest_marker(TESTRAIL_PREFIX):
             testcaseids = item.get_closest_marker(TESTRAIL_PREFIX).kwargs.get("ids")
-            if rep.when == "call" and testcaseids:
+            if rep.when in ["setup", "call"] and testcaseids:
                 if defectids:
                     self.add_result(
                         clean_test_ids(testcaseids),
@@ -270,34 +513,63 @@ class PyTestRailPlugin(object):
 
     def pytest_sessionfinish(self, session, exitstatus):
         """Publish results in TestRail"""
-        print("[{}] Start publishing".format(TESTRAIL_PREFIX))
-        if self.results:
-            tests_list = [str(result["case_id"]) for result in self.results]
-            print(
-                "[{}] Testcases to publish: {}".format(
-                    TESTRAIL_PREFIX, ", ".join(tests_list)
+        logger.info("[{}] Start publishing".format(TESTRAIL_PREFIX))
+        outcome = "success"
+        for result in self.results:
+            if result["status_id"] == 5:
+                outcome = "failure"
+                break
+        logger.info(f"Overall TestSuite Outcome: {outcome}")
+        self.jira(outcome)
+        error = None
+        if not self.results:
+            logger.warning("[{}] No test results to publish".format(TESTRAIL_PREFIX))
+            raise Exception("No test results to publish in TestRail")
+        logger.info(f"Test Results: {self.results}")
+        for result in self.results:
+            logger.info(f"Test Result: {result}\n")
+            if result["status_id"] != 1:
+                result["defects"] = self.issue_id
+        tests_list = [str(result["case_id"]) for result in self.results]
+        logger.info(f"Test formatted_results: {self.results}")
+        logger.info(
+            "[{}] Testcases to publish: {}".format(
+                TESTRAIL_PREFIX, ", ".join(tests_list)
+            )
+        )
+        if self.testrun_id:
+            self.add_results(self.testrun_id)
+        elif self.testplan_id:
+            testruns = self.get_available_testruns(
+                self.testplan_id, github_run_id=self.github_run_id
+            )
+            logger.info(
+                "[{}] Testruns to update: {}".format(
+                    TESTRAIL_PREFIX, ", ".join(map(str, testruns))
                 )
             )
-
-            if self.testrun_id:
-                self.add_results(self.testrun_id)
-            elif self.testplan_id:
-                testruns = self.get_available_testruns(self.testplan_id)
-                print(
-                    "[{}] Testruns to update: {}".format(
-                        TESTRAIL_PREFIX, ", ".join([str(elt) for elt in testruns])
-                    )
+            for testrun_id in testruns:
+                error = self.publish_results_for_run(
+                    testrun_id, github_run_id=self.github_run_id
                 )
-                for testrun_id in testruns:
-                    self.add_results(testrun_id)
-            else:
-                print("[{}] No data published".format(TESTRAIL_PREFIX))
+        else:
+            logger.info("[{}] No data published".format(TESTRAIL_PREFIX))
 
-            if self.close_on_complete and self.testrun_id:
-                self.close_test_run(self.testrun_id)
-            elif self.close_on_complete and self.testplan_id:
-                self.close_test_plan(self.testplan_id)
-        print("[{}] End publishing".format(TESTRAIL_PREFIX))
+        if self.close_on_complete and self.testrun_id:
+            self.close_test_run(self.testrun_id)
+        elif self.close_on_complete and self.testplan_id:
+            self.close_test_plan(self.testplan_id)
+        if error:
+            logger.error(
+                "[{}] Exception occurred during publishing: {}".format(
+                    TESTRAIL_PREFIX, str(error)
+                )
+            )
+            raise Exception(
+                "Error occurred during publishing in TestRail: {}".format(str(error))
+            )
+        else:
+            logger.info("[{}] End publishing".format(TESTRAIL_PREFIX))
 
     # plugin
 
@@ -352,7 +624,7 @@ class PyTestRailPlugin(object):
 
         # Manage case of "blocked" testcases
         if self.publish_blocked is False:
-            print(
+            logger.warning(
                 '[{}] Option "Don\'t publish blocked testcases" activated'.format(
                     TESTRAIL_PREFIX
                 )
@@ -362,7 +634,7 @@ class PyTestRailPlugin(object):
                 for test in self.get_tests(testrun_id)
                 if test.get("status_id") == TESTRAIL_TEST_STATUS["blocked"]
             ]
-            print(
+            logger.warning(
                 "[{}] Blocked testcases excluded: {}".format(
                     TESTRAIL_PREFIX, ", ".join(str(elt) for elt in blocked_tests_list)
                 )
@@ -375,7 +647,7 @@ class PyTestRailPlugin(object):
 
         # prompt enabling include all test cases from test suite when creating test run
         if self.include_all:
-            print(
+            logger.warning(
                 '[{}] Option "Include all testcases from test suite for test run" activated'.format(
                     TESTRAIL_PREFIX
                 )
@@ -440,7 +712,7 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print(
+            logger.warning(
                 '[{}] Info: Testcases not published for following reason: "{}"'.format(
                     TESTRAIL_PREFIX, error
                 )
@@ -477,10 +749,12 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print('[{}] Failed to create testrun: "{}"'.format(TESTRAIL_PREFIX, error))
+            logger.error(
+                '[{}] Failed to create testrun: "{}"'.format(TESTRAIL_PREFIX, error)
+            )
         else:
             self.testrun_id = response["id"]
-            print(
+            logger.warning(
                 '[{}] New testrun created with name "{}" and ID={}'.format(
                     TESTRAIL_PREFIX, testrun_name, self.testrun_id
                 )
@@ -496,9 +770,11 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print('[{}] Failed to close test run: "{}"'.format(TESTRAIL_PREFIX, error))
+            logger.error(
+                '[{}] Failed to close test run: "{}"'.format(TESTRAIL_PREFIX, error)
+            )
         else:
-            print(
+            logger.warning(
                 "[{}] Test run with ID={} was closed".format(
                     TESTRAIL_PREFIX, self.testrun_id
                 )
@@ -514,9 +790,11 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print('[{}] Failed to close test plan: "{}"'.format(TESTRAIL_PREFIX, error))
+            logger.error(
+                '[{}] Failed to close test plan: "{}"'.format(TESTRAIL_PREFIX, error)
+            )
         else:
-            print(
+            logger.warning(
                 "[{}] Test plan with ID={} was closed".format(
                     TESTRAIL_PREFIX, self.testplan_id
                 )
@@ -533,7 +811,7 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print(
+            logger.error(
                 '[{}] Failed to retrieve testrun: "{}"'.format(TESTRAIL_PREFIX, error)
             )
             return False
@@ -551,7 +829,7 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print(
+            logger.error(
                 '[{}] Failed to retrieve testplan: "{}"'.format(TESTRAIL_PREFIX, error)
             )
             return False
@@ -569,7 +847,7 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print(
+            logger.error(
                 '[{}] Failed to retrieve testplan: "{}"'.format(TESTRAIL_PREFIX, error)
             )
         else:
@@ -589,6 +867,8 @@ class PyTestRailPlugin(object):
         )
         error = self.client.get_error(response)
         if error:
-            print('[{}] Failed to get tests: "{}"'.format(TESTRAIL_PREFIX, error))
+            logger.error(
+                '[{}] Failed to get tests: "{}"'.format(TESTRAIL_PREFIX, error)
+            )
             return None
         return response
