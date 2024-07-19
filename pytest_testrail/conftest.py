@@ -225,6 +225,13 @@ def pytest_addoption(parser):
         required=False,
         help="Jira Parent Task ID",
     )
+    group.addoption(
+        "--jira-token",
+        action="store",
+        default=None,
+        required=False,
+        help="Jira token of the test case",
+    )
 
 
 def pytest_configure(config):
@@ -308,6 +315,9 @@ def pytest_configure(config):
                 ),
                 jira_parent_task_id=config_manager.getoption(
                     "jira-parent-task-id", "jira_parent_task_id", "TESTCASE"
+                ),
+                jira_token=config_manager.getoption(
+                    "jira-token", "jira_token", "TESTCASE"
                 ),
             ),
             # Name of plugin instance (allow to be used by other plugins)

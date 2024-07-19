@@ -192,6 +192,7 @@ class PyTestRailPlugin(object):
         jira_server=None,
         jira_username=None,
         jira_parent_task_id=None,
+        jira_token=None,
     ):
         self.assign_user_id = assign_user_id
         self.cert_check = cert_check
@@ -221,6 +222,7 @@ class PyTestRailPlugin(object):
         self.jira_server = jira_server
         self.jira_username = jira_username
         self.jira_parent_task_id = jira_parent_task_id
+        self.jira_token = jira_token
 
     def set_github_env_var(self, var_name, var_value):
         os.environ[var_name] = var_value
@@ -233,10 +235,14 @@ class PyTestRailPlugin(object):
 
     def get_client(self) -> jira.JIRA:
         user = self.jira_username
-        if os.environ.get("JIRA_TOKEN"):
-            token = os.environ.get("JIRA_TOKEN")
+        token = self.jira_token
+        jira_client = None
         if token:
             jira_client = jira.JIRA(self.jira_server, basic_auth=(user, token))
+        else:
+            logging.error(
+                "JIRA_TOKEN is not set, unable to create or update jira ticket"
+            )
         return jira_client
 
     def add_comment(self, client: jira.JIRA, issue_id: str, comment: str) -> bool:
@@ -399,52 +405,18 @@ class PyTestRailPlugin(object):
             self.add_comment(client, issue_id, comment)
         return issue_id
 
-    def jira(self) -> str:
+    def jira(self, outcome: str) -> str:
         try:
             client = self.get_client()
-            if self.pr_title is None:  # No PR associated with this notification
-                username = sys.argv[1]
-                testname = sys.argv[2]
-                outcome = sys.argv[3]  # "success" or "failure"
-                regex = re.compile(
-                    r"[^a-zA-Z0-9_]+"
-                )  # Expecting only letters and numbers
-                assert not re.match(regex, username)
-                issue_id = self.handle_ci_notifications(
-                    client, username, testname, outcome, self.github_commit_sha
-                )
-            else:  # PR is associated with this notification
-                jira_issue = re.findall(r"AVX-[0-9]+", self.pr_title)
-                msg = sys.argv[1]
-                if len(jira_issue) == 0:
-                    logging.error("No JIRA Issue found in the PR title")
-                    sys.exit(1)
-                else:
-                    issue_id = jira_issue[0]
+            username = self.jira_owner
+            testname = self.test_dirs
+            regex = re.compile(r"[^a-zA-Z0-9_]+")  # Expecting only letters and numbers
+            logger.info("username" + username)
+            logger.info("testname" + testname)
+            issue_id = self.handle_ci_notifications(
+                client, username, testname, outcome, self.github_commit_sha
+            )
 
-                existing_comment_id = self.check_repeat_comment(client, issue_id, msg)
-                if not existing_comment_id:
-                    if self.add_comment(
-                        client,
-                        issue_id,
-                        self.enrich_msg(
-                            msg,
-                            self.pr_number,
-                            self.pr_title,
-                            self.github_run_id,
-                            self.github_commit_sha,
-                        ),
-                    ):
-                        logging.info("Posted comment successfully!")
-                else:
-                    if self.append_repeat_failure(
-                        client,
-                        issue_id,
-                        self.github_commit_sha,
-                        existing_comment_id,
-                        self.github_run_id,
-                    ):
-                        logging.info("Updated comment successfully!")
             self.set_github_env_var("ISSUE_ID", issue_id)
             return issue_id
         except AssertionError:
@@ -484,17 +456,17 @@ class PyTestRailPlugin(object):
         else:
             if self.testrun_name is None:
                 self.testrun_name = testrun_name()
-
-            self.create_test_run(
-                self.assign_user_id,
-                self.project_id,
-                self.suite_id,
-                self.include_all,
-                self.testrun_name,
-                tr_keys,
-                self.milestone_id,
-                self.testrun_description,
-            )
+            if self.testrun_id is None:
+                self.create_test_run(
+                    self.assign_user_id,
+                    self.project_id,
+                    self.suite_id,
+                    self.include_all,
+                    self.testrun_name,
+                    tr_keys,
+                    self.milestone_id,
+                    self.testrun_description,
+                )
 
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
     def pytest_runtest_makereport(self, item, call):
@@ -542,7 +514,13 @@ class PyTestRailPlugin(object):
     def pytest_sessionfinish(self, session, exitstatus):
         """Publish results in TestRail"""
         logger.info("[{}] Start publishing".format(TESTRAIL_PREFIX))
-        self.jira()
+        outcome = "success"
+        for result in self.results:
+            if result["status_id"] == 5:
+                outcome = "failure"
+                break
+        logger.info(f"Overall TestSuite Outcome: {outcome}")
+        self.jira(outcome)
         error = None
         if not self.results:
             logger.error("[{}] No test results to publish".format(TESTRAIL_PREFIX))
