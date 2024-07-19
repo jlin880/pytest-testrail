@@ -223,6 +223,7 @@ class PyTestRailPlugin(object):
         self.jira_username = jira_username
         self.jira_parent_task_id = jira_parent_task_id
         self.jira_token = jira_token
+        self.issue_id = ""
 
     def set_github_env_var(self, var_name, var_value):
         os.environ[var_name] = var_value
@@ -248,24 +249,24 @@ class PyTestRailPlugin(object):
     def add_comment(self, client: jira.JIRA, issue_id: str, comment: str) -> bool:
         """Add comment to an issue"""
         try:
-            issue = client.issue(issue_id)
+            issue = client.issue(self.issue_id)
             client.add_comment(issue, comment)
         except jira.JIRAError as e:
-            logging.exception(f"Unable to post comment to {issue_id} {e}")
+            logging.exception(f"Unable to post comment to {self.issue_id} {e}")
             return False
         return True
 
     def check_repeat_comment(
         self, client: jira.JIRA, issue_id: str, msg: str
     ) -> Union[str, None]:
-        list_of_comments = client.comments(issue_id)
+        list_of_comments = client.comments(self.issue_id)
         for comment in reversed(list_of_comments):
             # reversed ^^ so that we find the last comment made first.
             comment_id: str = comment.id
             assert type(comment_id) == str
             if (
-                msg in client.comment(issue_id, comment_id).body
-                and client.comment(issue_id, comment_id).author.emailAddress
+                msg in client.comment(self.issue_id, comment_id).body
+                and client.comment(self.issue_id, comment_id).author.emailAddress
                 == self.jira_username
             ):
                 return comment_id
@@ -279,7 +280,7 @@ class PyTestRailPlugin(object):
         comment_id: str,
         github_run_id: str,
     ) -> bool:
-        comment_to_update = client.comment(issue_id, comment_id)
+        comment_to_update = client.comment(self.issue_id, comment_id)
         time = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
         new_body = f"""
         * Test failure repeated @ {time} on commit {github_commit_sha[0:7]}
@@ -290,7 +291,7 @@ class PyTestRailPlugin(object):
             comment_to_update.update(body=new_body)
         except jira.JIRAError as e:
             logging.exception(
-                f"Unable to update comment {comment_id} in issue {issue_id}"
+                f"Unable to update comment {comment_id} in issue {self.issue_id}"
             )
             return False
         return True
@@ -337,7 +338,7 @@ class PyTestRailPlugin(object):
         self, client: jira.JIRA, task_name, username, description_text: str
     ) -> bool:
         try:
-            issue_id = client.create_issue(
+            self.issue_id = client.create_issue(
                 project={"key": "QE"},
                 description=description_text,
                 summary=task_name,
@@ -345,13 +346,13 @@ class PyTestRailPlugin(object):
                 components=[{"name": "e2e"}],
                 parent={"key": self.jira_parent_task_id},
             )
-            client.assign_issue(issue_id.key, username)
+            client.assign_issue(self.issue_id.key, username)
             logging.info(f"Creating new issue for {username} with title {task_name}")
-            # logging.info(f"Creating {issue_id.key} for {username} with title {task_name}")
+            # logging.info(f"Creating {self.issue_id.key} for {username} with title {task_name}")
         except jira.JIRAError as e:
             logging.error(f"Could not create a new jira because: {e}")
             return None
-        return issue_id
+        return self.issue_id
 
     def generate_workflow_link(self, github_run_id: str) -> str:
         return f"https://github.com/AviatrixDev/cloudn/actions/runs/{github_run_id}"
@@ -365,7 +366,9 @@ class PyTestRailPlugin(object):
         git_commit_sha: str,
     ) -> None:
         task_name = f"e2e-ci-failure for {testname}"
-        exists, issue_id = self.check_if_existing_task_open(client, task_name, username)
+        exists, self.issue_id = self.check_if_existing_task_open(
+            client, task_name, username
+        )
         check_mark = "\U00002705"
         cross_mark = "\U0000274C"
         if not exists:  # Create a new task if it doesn't exist
@@ -379,7 +382,7 @@ class PyTestRailPlugin(object):
                 If the test is not stable, please remove the pytest marker so this test is not picked up during automated runs.
                 """
                 summary = f"{task_name}"
-                issue_id = self.create_new_task(
+                self.issue_id = self.create_new_task(
                     client, summary, username, description_text
                 )
         else:  # Update the existing task
@@ -400,10 +403,10 @@ class PyTestRailPlugin(object):
                 """
 
             logging.info(
-                f"Found an existing issue {issue_id}. Adding another comment to it to capture this {outcome}."
+                f"Found an existing issue {self.issue_id}. Adding another comment to it to capture this {outcome}."
             )
-            self.add_comment(client, issue_id, comment)
-        return issue_id
+            self.add_comment(client, self.issue_id, comment)
+        return self.issue_id
 
     def jira(self, outcome: str) -> str:
         try:
@@ -413,12 +416,12 @@ class PyTestRailPlugin(object):
             regex = re.compile(r"[^a-zA-Z0-9_]+")  # Expecting only letters and numbers
             logger.info("username" + username)
             logger.info("testname" + testname)
-            issue_id = self.handle_ci_notifications(
+            self.issue_id = self.handle_ci_notifications(
                 client, username, testname, outcome, self.github_commit_sha
             )
 
-            self.set_github_env_var("ISSUE_ID", issue_id)
-            return issue_id
+            self.set_github_env_var("self.issue_id", self.issue_id)
+            return self.issue_id
         except AssertionError:
             logging.error("Checks failed; not creating or updating Jiras!")
             return ""
@@ -456,6 +459,7 @@ class PyTestRailPlugin(object):
         else:
             if self.testrun_name is None:
                 self.testrun_name = testrun_name()
+
             if self.testrun_id is None:
                 self.create_test_run(
                     self.assign_user_id,
@@ -525,8 +529,11 @@ class PyTestRailPlugin(object):
         if not self.results:
             logger.error("[{}] No test results to publish".format(TESTRAIL_PREFIX))
             raise Exception("No test results to publish in TestRail")
-
+        logger.info(f"Test Results: {self.results}")
+        for result in self.results:
+            result["defects"] = self.issue_id
         tests_list = [str(result["case_id"]) for result in self.results]
+        logger.info(f"Test formatted_results: {self.results}")
         logger.info(
             "[{}] Testcases to publish: {}".format(
                 TESTRAIL_PREFIX, ", ".join(tests_list)
@@ -936,6 +943,23 @@ class PyTestRailPlugin(object):
                     TESTRAIL_PREFIX, self.testplan_id
                 )
             )
+
+    def check_test_run_completed(self):
+        """
+        Check if the specified test run is completed in TestRail.
+
+        :return: True if the test run exists and is completed, False if open, None if an error occurred
+        """
+        response = self.client.send_get(
+            GET_TESTRUN_URL.format(self.testrun_id), cert_check=self.cert_check
+        )
+        logger.info(response)
+        if response["is_completed"]:
+            logger.error(
+                f'Failed to update test run: {self.testrun_id} as it was already completed on {response["completed_on"]}'
+            )
+
+        return response.get("is_completed", False)
 
     def is_testrun_available(self):
         """
