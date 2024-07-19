@@ -460,16 +460,17 @@ class PyTestRailPlugin(object):
             if self.testrun_name is None:
                 self.testrun_name = testrun_name()
 
-            self.create_test_run(
-                self.assign_user_id,
-                self.project_id,
-                self.suite_id,
-                self.include_all,
-                self.testrun_name,
-                tr_keys,
-                self.milestone_id,
-                self.testrun_description,
-            )
+            if self.testrun_id is None:
+                self.create_test_run(
+                    self.assign_user_id,
+                    self.project_id,
+                    self.suite_id,
+                    self.include_all,
+                    self.testrun_name,
+                    tr_keys,
+                    self.milestone_id,
+                    self.testrun_description,
+                )
 
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
     def pytest_runtest_makereport(self, item, call):
