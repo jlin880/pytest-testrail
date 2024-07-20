@@ -46,7 +46,8 @@ GET_TESTRUN_URL = "get_run/{}"
 GET_TESTPLAN_URL = "get_plan/{}"
 GET_TESTS_URL = "get_tests/{}"
 COMMENT_SIZE_LIMIT = 4000
-RESULTS_FILE_PATH = "/home/ubuntu/test_results.txt"
+RESULTS_DIR = "/home/ubuntu"
+RESULTS_FILE_PATH = os.path.join(RESULTS_DIR, "test_results.txt")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -504,8 +505,13 @@ class PyTestRailPlugin(object):
             if result["status_id"] != 1:
                 result["defects"] = self.issue_id
         tests_list = [str(result["case_id"]) for result in self.results]
-        with open(RESULTS_FILE_PATH, "w") as file:
-            file.write(str(self.results))
+        try:
+            os.makedirs(RESULTS_DIR, exist_ok=True)
+            with open(RESULTS_FILE_PATH, "w") as file:
+                file.write(str(session.results))
+            logger.info(f"Test results saved to: {RESULTS_FILE_PATH}")
+        except Exception as e:
+            logger.error(f"Failed to save test results: {e}")
         logger.info(f"Test results saved to: {RESULTS_FILE_PATH}")
         logger.info(
             "[{}] Testcases to publish: {}".format(
